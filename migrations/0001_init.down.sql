@@ -1,0 +1,10 @@
+DROP TRIGGER IF EXISTS wager_terminal_immutable ON wager_transactions;
+DROP TRIGGER IF EXISTS ledger_no_update ON wallet_ledger_entries;
+DROP FUNCTION IF EXISTS reject_terminal_wager_update();
+DROP FUNCTION IF EXISTS reject_ledger_mutation();
+DROP TABLE IF EXISTS reference_waits;
+DROP TABLE IF EXISTS outbox;
+DROP TABLE IF EXISTS inbox;
+DROP TABLE IF EXISTS wallet_ledger_entries;
+DROP TABLE IF EXISTS wager_transactions;
+DROP TABLE IF EXISTS wallets;

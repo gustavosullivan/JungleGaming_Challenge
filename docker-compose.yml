@@ -1,0 +1,127 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:4.7
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  sqs-init:
+    image: amazon/aws-cli:2.27.50
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_PAGER: ""
+    entrypoint: ["bash", "/init.sh"]
+    volumes:
+      - ./deploy/sqs/init.sh:/init.sh:ro
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME: http://localhost:8081
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./deploy/keycloak/realm-jungle.json:/opt/keycloak/data/import/realm-jungle.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/8080'"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+
+  keycloak-setup:
+    image: quay.io/keycloak/keycloak:26.3
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    entrypoint: ["bash", "/setup/setup.sh"]
+    volumes:
+      - ./deploy/keycloak/setup.sh:/setup/setup.sh:ro
+
+  migrate:
+    build: .
+    entrypoint: ["/app/migrate", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering?sslmode=disable
+    restart: "no"
+
+  app:
+    build: .
+    ports:
+      - "8090:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      sqs-init:
+        condition: service_completed_successfully
+      keycloak-setup:
+        condition: service_completed_successfully
+    env_file:
+      - deploy/app.env
+
+  app-2:
+    profiles: ["multi"]
+    build: .
+    ports:
+      - "8082:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      sqs-init:
+        condition: service_completed_successfully
+      keycloak-setup:
+        condition: service_completed_successfully
+    env_file:
+      - deploy/app.env
+
+  app-3:
+    profiles: ["multi"]
+    build: .
+    ports:
+      - "8083:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      sqs-init:
+        condition: service_completed_successfully
+      keycloak-setup:
+        condition: service_completed_successfully
+    env_file:
+      - deploy/app.env
