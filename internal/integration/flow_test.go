@@ -953,7 +953,7 @@ func discardLog() *slog.Logger {
 }
 
 func dsn() string {
-	return env("DATABASE_URL", "postgres://wagering:wagering@localhost:5432/wagering?sslmode=disable")
+	return env("DATABASE_URL", "postgres://wagering:wagering@localhost:5435/wagering?sslmode=disable")
 }
 
 func env(key, fallback string) string {
