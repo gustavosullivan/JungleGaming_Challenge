@@ -32,6 +32,8 @@ A `Idempotency-Key`, o `messageId` e o resto do transporte ficam de fora. HTTP e
 
 Tem índice único em `idempotency_key` e em `(provider_id, external_transaction_id)`. Mesma chave e mesmo hash devolvem o que já foi gravado, com o saldo daquela decisão. Chave reaproveitada com outro hash, ou a mesma operação externa com outra chave, é 409. Isso fica no Postgres, não em memória.
 
+As duas buscas são consultas separadas em `READ COMMITTED`, então outra instância pode confirmar a mesma operação entre uma e outra. Por isso a linha achada pelo id externo também é comparada pela chave: mesma chave é replay, só chave diferente é 409. Se duas instâncias passarem juntas pelas buscas, o índice único barra a segunda no `INSERT` e ela relê o que a primeira gravou.
+
 ## Concorrência
 
 O lock é `SELECT ... FROM wallets WHERE id = $1 FOR UPDATE`. Carteira diferente não espera. Não tem lock global nem fila dentro do processo.
@@ -78,7 +80,9 @@ O envelope tem `eventId`, `eventType`, `aggregateId`, `correlationId`, `causatio
 
 ## Auth
 
-Keycloak, realm `jungle`, client credentials. A API confere RS256, issuer, expiração e audience `wagering-api` no JWKS. Não emite token e não guarda senha.
+Keycloak, realm `jungle`, client credentials. Escolhi o Keycloak porque é o IdP que o desafio recomenda, roda no Compose sem conta externa e importa o realm de um JSON versionado (`deploy/keycloak/realm-jungle.json`), então clients, secrets, papéis e o claim `provider_id` sobem iguais em qualquer máquina. Client credentials é o fluxo OAuth 2.0 de serviço pra serviço: o provedor de jogo é um sistema, não uma pessoa.
+
+A API confere RS256, issuer, expiração e audience `wagering-api` com as chaves do JWKS. Não emite token e não guarda senha. O Keycloak está com `KC_HOSTNAME` fixo em `http://localhost:8081`, então o `iss` é o mesmo pra quem pede token de fora e pra API dentro da rede.
 
 `internal` abre carteira, lê ledger e reconcilia. `provider` manda operação e lê transação. O claim `provider_id` tem que ser o do corpo e o do path. Transação de outro provedor, inclusive replay e `OPENING`, responde 404 pra não dizer se existe. Pedir o path de outro provedor responde 403. Nenhum desses caminhos grava saldo.
 
@@ -96,6 +100,23 @@ Log em JSON com `correlationId`, `messageId`, `transactionId`, `walletId`, `prov
 
 `/metrics` tem resultado por kind e status, replay, retry, DLQ, conflito de versão, idade da outbox mais antiga e divergência de reconciliação.
 
-## O que eu não fiz
+## Interpretações
 
-Partida dobrada com conta da casa, tracing e teste de carga. `FAILED` não é gravado pelos workers, pelo motivo da seção de estados. Operação sem dependência termina no mesmo commit de propósito: o enunciado deixa, e um `PENDING` gravado à toa só aumentaria a janela de crash.
+Pontos em que o enunciado deixa margem e a leitura que eu adotei:
+
+- Operação sem dependência termina no mesmo commit, sem `PENDING` gravado. O enunciado deixa, e um `PENDING` gravado à toa só aumentaria a janela de crash.
+- A abertura com saldo positivo fica na versão 1. O crédito inicial é a criação da carteira, não um movimento depois dela.
+- WIN pode vir sem referência. Se vier com uma, ela tem que ser uma BET da mesma rodada, e a resolução segue as mesmas regras de pendência das reversões.
+- LOSS com valor diferente de `"0.00"` é gravado como `REJECTED` / `INVALID_AMOUNT`, não como 400. Assim a rejeição fica auditável e o replay devolve a mesma resposta.
+- REFUND e ROLLBACK sobre a mesma BET são mutuamente exclusivos: os dois devolveriam o mesmo débito.
+- Transação de outro provedor responde 404, e não 403, pra não revelar que ela existe.
+- O SQS não leva JWT. A autorização ali é a credencial do broker; o consumidor ainda valida o payload e recusa `OPENING`.
+
+## Limitações e o que não fiz
+
+- Partida dobrada com conta da casa, tracing e teste de carga.
+- `FAILED` não é gravado pelos workers, pelo motivo da seção de estados.
+- O LocalStack roda sem persistência: se o container reiniciar, as filas somem até o `sqs-init` rodar de novo.
+- O Keycloak roda em `start-dev`, com HTTP e `KC_HOSTNAME` fixo em `localhost:8081`. Serve pro ambiente local, não pra produção.
+- Os testes de integração usam o mesmo banco e as mesmas filas do Compose e limpam as tabelas. Precisam das instâncias da API paradas e não podem rodar contra dados que se queira guardar.
+- O `-race` precisa de cgo. No Windows sem gcc, roda num container Go, como está no README.
