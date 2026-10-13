@@ -162,7 +162,10 @@ func (s *Service) submitInTx(ctx context.Context, tx port.Tx, cmd Command) (Resu
 		return Result{}, err
 	}
 	if byExternal != nil {
-		return Result{}, &errs.Conflict{Reason: "external transaction already recorded with another idempotency key"}
+		if byExternal.IdempotencyKey() != cmd.IdempotencyKey {
+			return Result{}, &errs.Conflict{Reason: "external transaction already recorded with another idempotency key"}
+		}
+		return replay(byExternal, cmd)
 	}
 
 	w, err := tx.LockWallet(ctx, cmd.WalletID, port.LockUpdate)
