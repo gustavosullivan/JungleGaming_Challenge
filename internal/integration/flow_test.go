@@ -26,23 +26,25 @@ import (
 	"github.com/jungle-gaming/wagering/internal/app/wagering"
 	walletsvc "github.com/jungle-gaming/wagering/internal/app/wallet"
 	"github.com/jungle-gaming/wagering/internal/domain/wager"
-	"github.com/jungle-gaming/wagering/internal/fxapp"
 	"github.com/jungle-gaming/wagering/internal/platform/auth"
 	"github.com/jungle-gaming/wagering/internal/platform/config"
 	"github.com/jungle-gaming/wagering/internal/platform/metrics"
 	"github.com/jungle-gaming/wagering/internal/platform/migrate"
 	"github.com/jungle-gaming/wagering/internal/platform/postgres"
-	"github.com/jungle-gaming/wagering/internal/platform/sqs"
 	"github.com/jungle-gaming/wagering/internal/transport/httpapi"
 	"github.com/jungle-gaming/wagering/internal/transport/outbox"
 	"github.com/jungle-gaming/wagering/internal/transport/sqsconsumer"
 	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/fx"
 )
 
 func TestMain(m *testing.M) {
-	if os.Getenv("WAGER_PROC") == "submit" {
+	switch os.Getenv("WAGER_PROC") {
+	case "submit":
 		os.Exit(submitFromEnv())
+	case "pending-and-hang":
+		os.Exit(pendingAndHang())
+	case "consume-and-hang":
+		os.Exit(consumeAndHang())
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -138,21 +140,35 @@ func TestFiftyDuplicatesAndTwoLargeBets(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 50)
+	results := make([]wagering.Result, 50)
+	errList := make([]error, 50)
+	start := make(chan struct{})
 	for i := 0; i < 50; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, err := stacks[i%3].wagers.Submit(context.Background(), command(opened, player, "same-bet", "provider-a:same-bet", "BET", "10.00", ""))
-			errCh <- err
+			<-start
+			results[i], errList[i] = stacks[i%3].wagers.Submit(context.Background(), command(opened, player, "same-bet", "provider-a:same-bet", "BET", "10.00", ""))
 		}(i)
 	}
+	close(start)
 	wg.Wait()
-	close(errCh)
-	for err := range errCh {
+	fresh, replays := 0, 0
+	for i, err := range errList {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if results[i].TransactionID != results[0].TransactionID || results[i].Status != wager.StatusProcessed {
+			t.Fatalf("result %d = %+v", i, results[i])
+		}
+		if results[i].IdempotentReplay {
+			replays++
+		} else {
+			fresh++
+		}
+	}
+	if fresh != 1 || replays != 49 {
+		t.Fatalf("fresh=%d replays=%d, want 1 and 49", fresh, replays)
 	}
 	if n := count(t, pool, `SELECT count(*) FROM wallet_ledger_entries WHERE wallet_id = $1 AND direction = 'DEBIT'`, opened.ID); n != 1 {
 		t.Fatalf("duplicate debits = %d", n)
@@ -627,40 +643,8 @@ func TestMigrationsDownAndUp(t *testing.T) {
 	}
 }
 
-func TestAppStartsAndStops(t *testing.T) {
-	t.Setenv("HTTP_ADDR", "127.0.0.1:0")
-	t.Setenv("DATABASE_URL", dsn())
-	t.Setenv("SQS_ENDPOINT", env("SQS_ENDPOINT", "http://127.0.0.1:4566"))
-	t.Setenv("SQS_QUEUE_URL", env("SQS_QUEUE_URL", "http://127.0.0.1:4566/000000000000/wager-transactions.fifo"))
-	t.Setenv("SQS_DLQ_URL", env("SQS_DLQ_URL", "http://127.0.0.1:4566/000000000000/wager-transactions-dlq.fifo"))
-	t.Setenv("SQS_EVENTS_QUEUE_URL", env("SQS_EVENTS_QUEUE_URL", "http://127.0.0.1:4566/000000000000/wager-events.fifo"))
-	t.Setenv("OIDC_ISSUER", env("OIDC_ISSUER", "http://127.0.0.1:8081/realms/jungle"))
-	t.Setenv("OIDC_JWKS_URL", env("OIDC_JWKS_URL", "http://127.0.0.1:8081/realms/jungle/protocol/openid-connect/certs"))
-	t.Setenv("SQS_WAIT_TIME_SECONDS", "1")
-	t.Setenv("SHUTDOWN_TIMEOUT", "5s")
-
-	var srv *httpapi.Server
-	app := fx.New(fxapp.Options(), fx.Populate(&srv), fx.NopLogger)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := app.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer stopCancel()
-	if err := app.Stop(stopCtx); err != nil {
-		t.Fatal(err)
-	}
-	if srv == nil || srv.Addr() == "" {
-		t.Fatal("server did not bind")
-	}
-}
-
 func TestAuthenticationAndProviderIsolation(t *testing.T) {
-	issuer := env("OIDC_ISSUER", "http://localhost:8081/realms/jungle")
-	if !keycloakUp(issuer) {
-		t.Skip("keycloak is not reachable at " + issuer)
-	}
+	issuer := requireKeycloak(t)
 	wallets, wagers, pool := newStack(t, time.Second, 4)
 	defer pool.Close()
 	truncate(t, pool)
@@ -669,16 +653,8 @@ func TestAuthenticationAndProviderIsolation(t *testing.T) {
 	if err := rec.Register(reg); err != nil {
 		t.Fatal(err)
 	}
-	queues, err := sqs.New(config.Config{
-		SQSEndpoint: env("SQS_ENDPOINT", "http://127.0.0.1:4566"), SQSRegion: "us-east-1",
-		AWSAccessKey: "test", AWSSecretKey: "test",
-		QueueURL:       env("SQS_QUEUE_URL", "http://127.0.0.1:4566/000000000000/wager-transactions.fifo"),
-		EventsQueueURL: env("SQS_EVENTS_QUEUE_URL", "http://127.0.0.1:4566/000000000000/wager-events.fifo"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler := httpapi.NewHandler(wallets, wagers, auth.NewVerifier(issuer, env("OIDC_JWKS_URL", issuer+"/protocol/openid-connect/certs"), "wagering-api"), pool, queues, reg, discardLog())
+	queues := newQueues(t, 5).client
+	handler := httpapi.NewHandler(wallets, wagers, auth.NewVerifier(issuer, jwksURL(), "wagering-api"), pool, queues, reg, discardLog())
 	srv := httptest.NewServer(handler)
 	defer srv.Close()
 
@@ -740,32 +716,75 @@ func TestAuthenticationAndProviderIsolation(t *testing.T) {
 		t.Fatalf("garbage token status %d", status)
 	}
 
-	short := token(t, issuer, "provider-short", "provider-short-secret")
-	time.Sleep(4 * time.Second)
-	if status := call(t, srv, http.MethodPost, "/wagering/transactions", short, withKey(bet, "provider-a:auth-bet")); status != http.StatusUnauthorized {
-		t.Fatalf("expired token status %d", status)
+	walletID := uuid.MustParse(opened.ID)
+	ledgerLines := count(t, pool, `SELECT count(*) FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID)
+	events := count(t, pool, `SELECT count(*) FROM outbox`)
+	noEffect := func(step string) {
+		t.Helper()
+		if got := balanceOf(t, pool, walletID); got != "30.00" {
+			t.Fatalf("%s: balance = %s", step, got)
+		}
+		if n := count(t, pool, `SELECT count(*) FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID); n != ledgerLines {
+			t.Fatalf("%s: ledger lines %d -> %d", step, ledgerLines, n)
+		}
+		if n := count(t, pool, `SELECT count(*) FROM outbox`); n != events {
+			t.Fatalf("%s: outbox rows %d -> %d", step, events, n)
+		}
 	}
-}
 
-func TestQueueRoundTripWhenLocalStackIsUp(t *testing.T) {
-	endpoint := env("SQS_ENDPOINT", "http://127.0.0.1:4566")
-	cfg := config.Config{
-		SQSEndpoint: endpoint, SQSRegion: "us-east-1", AWSAccessKey: "test", AWSSecretKey: "test",
-		QueueURL:       env("SQS_QUEUE_URL", endpoint+"/000000000000/wager-transactions.fifo"),
-		DLQURL:         env("SQS_DLQ_URL", endpoint+"/000000000000/wager-transactions-dlq.fifo"),
-		EventsQueueURL: env("SQS_EVENTS_QUEUE_URL", endpoint+"/000000000000/wager-events.fifo"),
-		SQSMaxMessages: 5, SQSWaitSeconds: 1, SQSVisibilitySeconds: 10, ShutdownTimeout: 5 * time.Second,
-		OutboxPoll: time.Second, OutboxLease: 30 * time.Second,
+	for _, path := range []string{"/wallets/" + opened.ID, "/wallets/" + opened.ID + "/ledger"} {
+		status, body := callJSON(t, srv, http.MethodGet, path, providerA, nil)
+		if status != http.StatusForbidden || strings.Contains(string(body), "30.00") {
+			t.Fatalf("provider on internal %s: %d %s", path, status, body)
+		}
 	}
-	client, err := sqs.New(cfg)
-	if err != nil {
+	if status := call(t, srv, http.MethodPost, "/wallets/"+opened.ID+"/reconciliation", providerB, nil); status != http.StatusForbidden {
+		t.Fatalf("provider reconciliation status %d", status)
+	}
+	if status := call(t, srv, http.MethodPost, "/wagering/transactions", internal, withKey(bet, "provider-a:internal-bet")); status != http.StatusForbidden {
+		t.Fatalf("internal submit status %d", status)
+	}
+
+	stolen := betBody(player, opened.ID, "provider-b", "auth-bet", "BET", "10.00", "")
+	status, resp = callJSON(t, srv, http.MethodPost, "/wagering/transactions", providerB, withKey(stolen, "provider-a:auth-bet"))
+	if status != http.StatusForbidden || strings.Contains(string(resp), result.TransactionID) {
+		t.Fatalf("provider b replaying a's key: %d %s", status, resp)
+	}
+	status, resp = callJSON(t, srv, http.MethodGet, "/wagering/transactions/"+result.TransactionID, providerB, nil)
+	if strings.Contains(string(resp), opened.ID) || strings.Contains(string(resp), player.String()) {
+		t.Fatalf("foreign read leaked data: %d %s", status, resp)
+	}
+	var openingID string
+	if err := pool.QueryRow(context.Background(), `SELECT id::text FROM wager_transactions WHERE wallet_id = $1 AND kind = 'OPENING'`, walletID).Scan(&openingID); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := client.Ready(ctx); err != nil {
-		t.Skip("localstack is not reachable: " + err.Error())
+	if status := call(t, srv, http.MethodGet, "/wagering/transactions/"+openingID, providerA, nil); status != http.StatusNotFound {
+		t.Fatalf("provider reading the internal opening %d", status)
 	}
+	if status := call(t, srv, http.MethodGet, "/wagering/transactions/"+result.TransactionID, internal, nil); status != http.StatusOK {
+		t.Fatalf("internal read %d", status)
+	}
+
+	tampered := providerA[:len(providerA)-6] + "AAAAAA"
+	if status := call(t, srv, http.MethodPost, "/wagering/transactions", tampered, withKey(betBody(player, opened.ID, "provider-a", "tampered", "BET", "1.00", ""), "provider-a:tampered")); status != http.StatusUnauthorized {
+		t.Fatalf("tampered signature status %d", status)
+	}
+	if status := call(t, srv, http.MethodPost, "/wagering/transactions", "", withKey(betBody(player, opened.ID, "provider-a", "anon", "BET", "1.00", ""), "provider-a:anon")); status != http.StatusUnauthorized {
+		t.Fatalf("missing token on submit %d", status)
+	}
+	noEffect("rejected calls")
+
+	short := token(t, issuer, "provider-short", "provider-short-secret")
+	time.Sleep(4 * time.Second)
+	if status := call(t, srv, http.MethodPost, "/wagering/transactions", short, withKey(betBody(player, opened.ID, "provider-a", "expired-bet", "BET", "1.00", ""), "provider-a:expired-bet")); status != http.StatusUnauthorized {
+		t.Fatalf("expired token status %d", status)
+	}
+	noEffect("expired token")
+}
+
+func TestQueueRoundTrip(t *testing.T) {
+	q := newQueues(t, 5)
+	cfg, client := q.cfg, q.client
 	wallets, wagers, pool := newStack(t, time.Second, 4)
 	defer pool.Close()
 	truncate(t, pool)
@@ -787,6 +806,22 @@ func TestQueueRoundTripWhenLocalStackIsUp(t *testing.T) {
 	events, err := client.ReceiveEvents(context.Background(), 10)
 	if err != nil || len(events) == 0 {
 		t.Fatalf("events %d %v", len(events), err)
+	}
+	ids := map[string]bool{}
+	for _, raw := range events {
+		var envelope struct {
+			EventID   string `json:"eventId"`
+			EventType string `json:"eventType"`
+		}
+		if err := json.Unmarshal(raw, &envelope); err != nil || envelope.EventID == "" {
+			t.Fatalf("event %s: %v", raw, err)
+		}
+		ids[envelope.EventID] = true
+	}
+	for id := range ids {
+		if count(t, pool, `SELECT count(*) FROM outbox WHERE event_id = $1 AND published_at IS NOT NULL`, uuid.MustParse(id)) != 1 {
+			t.Fatalf("event %s was received but is not marked as published", id)
+		}
 	}
 }
 
@@ -869,6 +904,7 @@ func truncate(t *testing.T, pool *pgxpool.Pool) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { assertFinancialConsistency(t) })
 }
 
 func count(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int {
