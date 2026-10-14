@@ -40,7 +40,7 @@ O lock é `SELECT ... FROM wallets WHERE id = $1 FOR UPDATE`. Carteira diferente
 
 O `UPDATE` do saldo ainda exige `version = $anterior`, e o `CHECK` não deixa `balance_minor` negativo. Se duas escritas passassem do lock, a segunda não acharia a versão e a transação inteira desfaz.
 
-O caso das duas apostas de 80 em saldo de 100 fica com uma `PROCESSED`, uma `REJECTED` (`INSUFFICIENT_BALANCE`), saldo 20.00 e um débito só. Tem teste com três pools e outro com três processos separados.
+O caso das duas apostas de 80 em saldo de 100 fica com uma `PROCESSED`, uma `REJECTED` (`INSUFFICIENT_BALANCE`), saldo 20.00 e um débito só. Tem teste com três pools, com três processos separados e com três aplicações Fx completas atrás de HTTP.
 
 No worker de referência a ordem é carteira, depois a transação. Na submissão também trava a carteira antes de inserir. Os dois lados pegam a carteira primeiro.
 
@@ -92,7 +92,15 @@ SQS não leva JWT. Quem publica na fila já passou pela credencial do broker (`t
 
 Config, pool, store, SQS, verifier, casos de uso, HTTP, consumer, outbox e o worker de referência entram por construtor. O `fx.Lifecycle` sobe o pool (com ping), o HTTP e os workers. No stop a ordem inverte: para de aceitar HTTP, cancela os loops, espera o que está em andamento e só então fecha o pool.
 
+O publisher da outbox e o worker de referência assumem linhas com lease (`locked_until`). Se o cancelamento do shutdown cortasse um lote no meio, as linhas assumidas e não tratadas ficariam travadas até o lease vencer, e nenhuma outra instância pegaria esses eventos e pendências nesse tempo. Por isso o lote que já foi assumido roda com um contexto que não herda o cancelamento (`context.WithoutCancel`), com prazo próprio: `SHUTDOWN_TIMEOUT` no publisher e 10s no worker de referência. O loop só para entre um lote e outro. Se o publisher ainda assim for interrompido, ele devolve as linhas que sobraram (`next_attempt_at` agora, lock limpo) antes de sair, e outra instância publica na hora. Achei isso num teste de reinício que falhava de vez em quando: a segunda aplicação esperava 30s por uma pendência que a primeira tinha assumido no meio do shutdown.
+
 O domínio não importa Fx, `net/http`, SQS nem `pgx`.
+
+## Testes
+
+Os unitários rodam sem Docker. O caso de uso roda contra `internal/app/port/memstore`, uma implementação em memória de `port.Store` que serializa as transações, aplica tudo numa cópia e só troca o estado no sucesso, e devolve os mesmos nomes de constraint do Postgres quando um índice único ou `CHECK` é violado. Isso deixa testar as regras dos cinco kinds, a política de zero, o conflito de payload, a pendência de referência com relógio controlado e o rollback de uma transação que falha no meio, sem banco. Auth usa um JWKS local com chaves RSA geradas no teste. O consumer e o publisher usam filas falsas pra provar a ordem commit → delete, o backoff de visibility, a DLQ e a devolução do lote no shutdown.
+
+Nada disso substitui a infraestrutura: os testes com a tag `integration` usam Postgres, Keycloak e LocalStack de verdade, sobem a aplicação Fx inteira (uma ou três instâncias), matam subprocessos no meio do trabalho e conferem saldo contra ledger em todas as carteiras ao fim de cada teste. Os mocks só entram onde a falha precisa ser provocada num ponto exato (um `Delete` que trava, um store que falha na primeira tentativa, um broker que recusa a primeira publicação), e mesmo nesses casos o resto é real.
 
 ## Log e métrica
 
@@ -114,9 +122,12 @@ Pontos em que o enunciado deixa margem e a leitura que eu adotei:
 
 ## Limitações e o que não fiz
 
-- Partida dobrada com conta da casa, tracing e teste de carga.
+- Partida dobrada com conta da casa e tracing.
 - `FAILED` não é gravado pelos workers, pelo motivo da seção de estados.
 - O LocalStack roda sem persistência: se o container reiniciar, as filas somem até o `sqs-init` rodar de novo.
 - O Keycloak roda em `start-dev`, com HTTP e `KC_HOSTNAME` fixo em `localhost:8081`. Serve pro ambiente local, não pra produção.
-- Os testes de integração usam o mesmo banco e as mesmas filas do Compose e limpam as tabelas. Precisam das instâncias da API paradas e não podem rodar contra dados que se queira guardar.
+- O ledger é lido em ordem de `created_at`, e esse horário vem do relógio da instância que gravou. Com relógios muito fora entre instâncias, a ordem de leitura do ledger de uma carteira pode não ser a ordem dos commits. O saldo não é afetado (o lock da carteira e a versão garantem a sequência), mas o `balance_after` lido em sequência pode parecer fora de ordem. O certo seria ordenar pela versão da carteira ou por um `now()` do banco.
+- Se o lote do worker de referência passar dos 10s de drenagem no shutdown, as linhas que sobraram ficam travadas até o lease de 30s vencer. O publisher devolve as dele; o worker de referência não.
+- Os testes de integração usam o mesmo banco do Compose e limpam as tabelas. As filas são criadas por teste, mas a outbox e as pendências ficam no banco compartilhado, então as instâncias da API precisam estar paradas e não dá pra rodar contra dados que se queira guardar.
+- Teste de carga, com vazão, p50/p95/p99 e atraso da outbox, não foi feito. A métrica de idade da outbox existe em `/metrics`, mas não tem roteiro de medição.
 - O `-race` precisa de cgo. No Windows sem gcc, roda num container Go, como está no README.

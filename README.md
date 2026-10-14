@@ -203,6 +203,8 @@ curl -s localhost:8090/providers/provider-a/wagering/transactions/transaction-12
 curl -s -X POST localhost:8090/wallets/<walletId>/reconciliation -H "Authorization: Bearer $TOKEN"
 ```
 
+O ledger vem em ordem estável. Quando há mais páginas, a resposta traz `nextCursor`, um valor opaco que vai de volta em `?cursor=`.
+
 Health é público: `GET /health/live` e `GET /health/ready`. Métricas em `GET /metrics`.
 
 | O que aconteceu | HTTP |
@@ -219,19 +221,77 @@ Health é público: `GET /health/live` e `GET /health/ready`. Métricas em `GET 
 
 Replay de uma rejeição volta 422 de novo, com o saldo que foi visto na hora da decisão, não o saldo de agora.
 
+Os 200, 202 e 422 do envio de operação têm o mesmo corpo. `balance` vem quando a decisão foi tomada, e `failureCode` só na rejeição:
+
+```json
+{ "transactionId": "0192f298-...", "status": "REJECTED", "failureCode": "INSUFFICIENT_BALANCE",
+  "balance": { "amount": "20.00", "currency": "BRL" }, "idempotentReplay": false }
+```
+
+Os outros erros têm um código fixo em `error` e uma mensagem curta:
+
+```json
+{ "error": "conflict", "message": "idempotency key reused with a different payload" }
+```
+
+| HTTP | `error` |
+| --- | --- |
+| 400 | `invalid_request` |
+| 401 | `unauthorized` |
+| 403 | `forbidden` |
+| 404 | `not_found` |
+| 409 | `conflict` |
+| 503 | `unavailable` |
+| 500 | `internal` |
+
+400 é entrada corrigível: nada é gravado, e o mesmo pedido pode voltar corrigido com a mesma chave. 422 é resultado definitivo: a rejeição fica gravada, a mesma chave sempre devolve a mesma rejeição, e uma nova tentativa precisa de outro `externalTransactionId`. 503 é transitório: pode reenviar igual.
+
+| `failureCode` | Quando |
+| --- | --- |
+| `INSUFFICIENT_BALANCE` | BET maior que o saldo |
+| `REVERSAL_INSUFFICIENT_BALANCE` | ROLLBACK de WIN ou REFUND que deixaria o saldo negativo |
+| `INVALID_AMOUNT` | BET, WIN, REFUND ou ROLLBACK com zero, ou LOSS diferente de `"0.00"` |
+| `CURRENCY_MISMATCH` | moeda diferente da carteira |
+| `PLAYER_WALLET_MISMATCH` | a carteira não é desse jogador |
+| `REFERENCE_NOT_FOUND` | a referência não chegou dentro das tentativas ou do TTL |
+| `REFERENCE_NOT_SUCCESSFUL` | a referência terminou `REJECTED` ou `FAILED` |
+| `REFERENCE_MISMATCH` | referência de outro jogador, carteira, moeda ou rodada |
+| `REFERENCE_AMOUNT_MISMATCH` | valor diferente do referenciado |
+| `INVALID_REFERENCE_KIND` | kind que não pode ser revertido por essa operação |
+| `ALREADY_REVERSED` | a referência já tem uma reversão processada |
+| `REVERSAL_IN_PROGRESS` | a referência já tem uma reversão pendente |
+
 ## Testes
+
+Os quatro comandos de verificação:
+
+```bash
+docker compose up --build
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+`go test ./...` roda só os unitários. Os de integração ficam atrás da build tag `integration` e precisam da infraestrutura no ar (abaixo).
 
 ### Unitários
 
-Não precisam de Docker:
+Não precisam de Docker nem de rede:
 
-```bash
-go vet ./...
-go test ./...
-go test -race ./...
-```
+| Pacote | O que cobre |
+| --- | --- |
+| `internal/domain/money` | parse, escala de duas casas, limites de `int64`, entrada inválida, moeda diferente |
+| `internal/domain/wallet`, `ledger`, `wager`, `event`, `idempotency` | invariantes da carteira, transições de estado, lançamento, envelope do evento, hash canônico |
+| `internal/app/wagering` | regras dos cinco kinds, política de zero por kind, conflito de payload na mesma chave, referência pendente (resolução, TTL, tentativas), abertura com transação interna e eventos, falha no meio da transação sem rastro, concorrência, isolamento por provedor. Roda contra um store em memória (`internal/app/port/memstore`) que imita os índices únicos e `CHECK`s do schema, e cada teste termina conferindo saldo contra ledger |
+| `internal/platform/auth` | token válido, expirado, `alg: none`, chave de fora, `kid` desconhecido, issuer e audience errados, sem papel, sem `provider_id`, assinatura adulterada. As chaves vêm de um JWKS local (`authtest`) |
+| `internal/transport/httpapi` | 401 em toda rota de negócio sem token válido, 403 nas operações internas pra provedor, isolamento entre provedores, sem efeito financeiro e sem vazar dado |
+| `internal/transport/sqsconsumer` | apaga só depois do commit, reentrega sem segundo débito, rejeição de negócio confirmada, mensagem venenosa deixada pra DLQ, backoff de visibility em falha transitória, parada no shutdown |
+| `internal/transport/outbox` | cada evento marcado uma vez, falha do broker reagendada, lote interrompido no shutdown devolvido na hora pra outro publisher |
+| `internal/fxapp` | o grafo do Fx resolve |
 
-Sem gcc no Windows, o `-race` roda num container Go:
+O store em memória não substitui o Postgres: os mesmos fluxos rodam de novo na integração contra o banco de verdade.
+
+O `-race` precisa de cgo. No Linux o toolchain já resolve. No Windows sem gcc, roda num container Go:
 
 ```bash
 docker run --rm -v "${PWD}:/src" -w /src golang:1.27 go test -race ./...
@@ -239,22 +299,25 @@ docker run --rm -v "${PWD}:/src" -w /src golang:1.27 go test -race ./...
 
 ### Preparar as dependências da integração
 
-Os testes de integração ficam atrás da build tag `integration`. Eles usam o Postgres, o Keycloak e o LocalStack de verdade, nas portas publicadas pelo Compose. O padrão do `DATABASE_URL` nos testes é `localhost:5435`, e o resto segue o `.env.example`.
-
-Os testes limpam as tabelas e leem a mesma fila e a mesma outbox da API. Com qualquer instância da API rodando, os workers dela consomem a mensagem antes do teste. Por isso: infraestrutura de pé, APIs paradas e nada no banco que você queira guardar.
+Os testes usam Postgres, Keycloak e LocalStack de verdade, nas portas publicadas pelo Compose. Nada disso é mock. Os padrões batem com o Compose (`localhost:5435`, `http://localhost:8081/realms/jungle`, `http://127.0.0.1:4566`) e dá pra trocar por `DATABASE_URL`, `OIDC_ISSUER`, `OIDC_JWKS_URL` e `SQS_ENDPOINT`.
 
 ```bash
 docker compose up -d postgres localstack sqs-init keycloak keycloak-setup migrate
 docker compose --profile multi stop app app-2 app-3
 ```
 
-Postgres é obrigatório. Os testes de Keycloak e de fila pulam se esses dois não responderem.
+As APIs precisam estar paradas. Os testes limpam as tabelas, e os workers de uma API no ar pegariam a outbox e as pendências de referência antes do teste. Não rode contra um banco com dados que você queira guardar.
+
+Cada teste que mexe com SQS cria as próprias filas FIFO (`it-<id>-in.fifo` com redrive pra `it-<id>-dlq.fifo`, e `it-<id>-events.fifo`) e apaga no fim. Assim um teste não lê mensagem de outro, nem da fila da API.
+
+Os três serviços são obrigatórios. Se o Keycloak ou o LocalStack não responderem, o teste falha, não pula. Pra uma rodada rápida só com Postgres, `INTEGRATION_ALLOW_SKIP=1` transforma essas falhas em skip.
 
 ### Integração
 
 ```bash
 go test -tags integration ./...
 go test -tags integration -race ./...
+go vet -tags integration ./...
 ```
 
 Sem gcc no Windows, o `-race` roda num container Go com a rede do host, que enxerga as mesmas portas e o mesmo emissor `localhost:8081` dos tokens:
@@ -263,9 +326,13 @@ Sem gcc no Windows, o `-race` roda num container Go com a rede do host, que enxe
 docker run --rm --network host -v "${PWD}:/src" -w /src golang:1.27 go test -tags integration -race ./...
 ```
 
+Ao fim de cada teste, um `Cleanup` confere todas as carteiras do banco: saldo gravado igual a créditos menos débitos do ledger, saldo nunca negativo, último `balance_after` igual ao saldo, nenhuma transação não processada com lançamento e nenhuma processada com movimento sem lançamento.
+
 ### Múltiplas instâncias
 
-Nos testes, as 50 apostas iguais, as duas de 80 em cima de 100 e as carteiras em paralelo usam três pools separados. O `TestTwoLargeBetsInSeparateProcesses` dispara três processos de verdade, cada um com a própria memória e as próprias conexões.
+O `TestThreeApplicationInstances` sobe três aplicações Fx completas no mesmo processo de teste, cada uma com o próprio pool, servidor HTTP, consumer, publisher e worker de referência, apontando pro mesmo banco e as mesmas filas. Ele repete ali as 50 apostas iguais (uma nova e 49 replays com o mesmo `transactionId`), as duas de 80 em cima de 100, seis carteiras em paralelo, uma pendência resolvida por qualquer instância e mensagens consumidas por uma delas.
+
+O `TestTwoLargeBetsInSeparateProcesses` dispara três processos de verdade, cada um com a própria memória e as próprias conexões. Os testes de processo morto também usam subprocessos: o binário de teste se chama de novo com `WAGER_PROC` definido.
 
 Na mão, com `docker compose --profile multi up --build`, dá pra mandar a mesma operação pelas portas 8090, 8082 e 8083. Todas devolvem o mesmo `transactionId` e o ledger fica com um lançamento só.
 
@@ -275,14 +342,30 @@ O que os testes de integração cobrem:
 
 | Falha | Teste |
 | --- | --- |
-| mesma operação recebida 50 vezes em paralelo | `TestFiftyDuplicatesAndTwoLargeBets` |
-| disputa de saldo entre processos independentes | `TestTwoLargeBetsInSeparateProcesses` |
-| consumidor cai depois do commit e antes de apagar a mensagem: reentrega com o mesmo `messageId` não debita de novo, e a mesma operação por HTTP vira replay | `TestInboxRedeliveryAndCrossChannel` |
-| dois publishers disputando a outbox, e um publisher que morre com eventos travados: outra instância assume e republica o mesmo `eventId` | `TestOutboxClaimIsExclusiveAndRecoverable` |
-| reversão antes da referência, resolvida depois | `TestReversalArrivesFirstAndExclusiveRefund` |
+| mesma operação recebida 50 vezes em paralelo: um débito, 49 replays | `TestFiftyDuplicatesAndTwoLargeBets`, `TestThreeApplicationInstances` |
+| duas apostas de 80.00 em saldo de 100.00 | `TestFiftyDuplicatesAndTwoLargeBets`, `TestTwoLargeBetsInSeparateProcesses`, `TestThreeApplicationInstances` |
+| carteiras diferentes em paralelo | `TestWalletsDoNotBlockEachOther`, `TestThreeApplicationInstances` |
+| a mesma mensagem recebida três vezes do SQS (dedup ids diferentes, `ReceiveCount` provado), um débito só | `TestRepeatedDeliveriesAreDeduplicatedByTheApplication` |
+| consumidor morto (processo encerrado) depois do commit e antes do `DeleteMessage`: a reentrega chega com `ReceiveCount` 2 e não debita de novo | `TestConsumerKilledAfterCommitBeforeDelete` |
+| falha transitória no banco: a mensagem volta pela fila e processa na segunda | `TestTransientFailureIsRetriedThroughTheQueue` |
+| mensagem venenosa vai pra DLQ pelo redrive | `TestPoisonMessageReachesTheDLQ` |
+| mesma operação por HTTP e por SQS, nas duas ordens, e cópia conflitante pela fila | `TestHTTPAndSQSForTheSameOperation`, `TestInboxRedeliveryAndCrossChannel` |
+| dois publishers na mesma outbox, publisher que morre com eventos travados | `TestOutboxClaimIsExclusiveAndRecoverable` |
+| três publishers com falha do broker na primeira tentativa, retry até o SQS real | `TestConcurrentPublishersRetryOnRealSQS` |
+| reversão antes da referência, resolvida depois; REFUND e ROLLBACK exclusivos | `TestReversalArrivesFirstAndExclusiveRefund` |
 | referência que nunca chega: rejeição por expiração | `TestReferenceExpires` |
+| processo morto depois de assumir uma pendência: outra instância retoma quando o lease vence | `TestPendingReferenceResumedAfterProcessIsKilled` |
+| reinício preservando idempotência, pendências e saldo | `TestRestartPreservesIdempotencyPendingAndBalances` |
+| subida e desligamento do Fx, com os workers parados, o pool fechado e a porta liberada | `TestFxAppStartsServesAndReleasesResources` |
 | ledger editado ou apagado direto no banco, saldo negativo forçado, transação terminal alterada | `TestLedgerIsImmutableAndBalanceCannotGoNegative` |
-| subida e desligamento da aplicação Fx com os workers | `TestAppStartsAndStops` |
+| migrations aplicadas, revertidas e aplicadas de novo | `TestMigrationsDownAndUp` |
+| token ausente, inválido, adulterado e expirado no Keycloak real; isolamento de provedor em escrita, leitura e replay; operação interna restrita; nada disso mexe em saldo, ledger ou outbox | `TestAuthenticationAndProviderIsolation` |
+
+Pra repetir um teste sensível a tempo várias vezes:
+
+```bash
+go test -tags integration -count=5 -run TestRestartPreservesIdempotencyPendingAndBalances ./internal/integration/...
+```
 
 Roteiros manuais, com `docker compose --profile multi up --build` no ar:
 
