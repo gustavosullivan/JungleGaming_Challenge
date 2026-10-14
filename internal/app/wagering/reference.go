@@ -10,6 +10,10 @@ import (
 	"github.com/jungle-gaming/wagering/internal/domain/wager"
 )
 
+// drainTimeout bounds how long a claimed batch may keep running after
+// shutdown starts.
+const drainTimeout = 10 * time.Second
+
 func (s *Service) RunReferenceLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.poll)
 	defer ticker.Stop()
@@ -18,7 +22,11 @@ func (s *Service) RunReferenceLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.SweepOnce(ctx)
+			// Cancelling a claimed batch would leave its rows locked for the
+			// whole lease, so the batch finishes even if shutdown begins.
+			work, cancel := context.WithTimeout(context.WithoutCancel(ctx), drainTimeout)
+			s.SweepOnce(work)
+			cancel()
 		}
 	}
 }

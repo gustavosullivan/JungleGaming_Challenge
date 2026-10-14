@@ -20,6 +20,7 @@ type Publisher struct {
 	metrics observe.Recorder
 	poll    time.Duration
 	lease   time.Duration
+	drain   time.Duration
 	worker  string
 	cancel  context.CancelFunc
 	stopped chan struct{}
@@ -31,9 +32,13 @@ func NewWorker(db port.Store, bus port.Publisher, log *slog.Logger, metrics obse
 	}
 	host, _ := os.Hostname()
 	id, _ := uuid.NewV7()
+	drain := cfg.ShutdownTimeout
+	if drain <= 0 {
+		drain = 10 * time.Second
+	}
 	return &Publisher{
 		db: db, bus: bus, log: log, metrics: metrics,
-		poll: cfg.OutboxPoll, lease: cfg.OutboxLease,
+		poll: cfg.OutboxPoll, lease: cfg.OutboxLease, drain: drain,
 		worker:  host + "-" + id.String()[:8],
 		stopped: make(chan struct{}),
 	}
@@ -67,13 +72,32 @@ func (p *Publisher) loop(ctx context.Context) {
 	defer close(p.stopped)
 	ticker := time.NewTicker(p.poll)
 	defer ticker.Stop()
-	p.PublishOnce(ctx)
+	p.publishBatch(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			p.PublishOnce(ctx)
+			p.publishBatch(ctx)
+		}
+	}
+}
+
+// publishBatch lets a claimed batch finish after shutdown starts, bounded by
+// the drain timeout; whatever is left when it expires is released.
+func (p *Publisher) publishBatch(ctx context.Context) {
+	work, cancel := context.WithTimeout(context.WithoutCancel(ctx), p.drain)
+	defer cancel()
+	p.PublishOnce(work)
+}
+
+func (p *Publisher) release(msgs []port.OutboxMessage) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	now := time.Now().UTC()
+	for _, msg := range msgs {
+		if err := p.db.RescheduleOutbox(ctx, msg.EventID, now); err != nil && p.log != nil {
+			p.log.Error("release outbox", "eventId", msg.EventID.String(), "err", err.Error())
 		}
 	}
 }
@@ -89,8 +113,9 @@ func (p *Publisher) PublishOnce(ctx context.Context) {
 		}
 		return
 	}
-	for _, msg := range msgs {
+	for i, msg := range msgs {
 		if ctx.Err() != nil {
+			p.release(msgs[i:])
 			return
 		}
 		err := p.bus.Publish(ctx, msg.AggregateID, msg.EventID.String(), msg.Payload)
